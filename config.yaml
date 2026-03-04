@@ -1,0 +1,13 @@
+# phone-controller configuration
+
+# ADB path (optional, uses PATH if not set)
+# adb_path: "adb"
+
+# Log level: debug, info, error
+log_level: info
+
+# Device settings
+# Cloud device IPs (Gemphonefarm, etc.) - port 5555 is default for ADB over network
+# Connect first: adb connect 42.114.191.99:5555
+device_ips:
+  - "42.114.191.99:5555"
