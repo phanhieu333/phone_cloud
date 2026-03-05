@@ -1,13 +1,19 @@
-# phone-controller configuration
+# AutoGetJS configuration (Viper)
 
-# ADB path (optional, uses PATH if not set)
-# adb_path: "adb"
-
-# Log level: debug, info, error
 log_level: info
 
-# Device settings
-# Cloud device IPs (Gemphonefarm, etc.) - port 5555 is default for ADB over network
-# Connect first: adb connect 42.114.191.99:5555
-device_ips:
-  - "42.114.191.99:5555"
+server:
+  port: "8080"
+
+# Base URL api device — khi chạy sẽ GET {device_api_url}/device lấy device_id đầu tiên
+device_api_url: "api/devices"
+
+# Device IDs tĩnh (optional), bổ sung hoặc thay thế khi không dùng device_api_url
+device_ids: []
+
+# Scripts: id và danh sách links
+scripts:
+  - id: "1"
+    links:
+      - "https://example.com/link1"
+      - "https://example.com/link2"
