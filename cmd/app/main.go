@@ -2,28 +2,36 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
-	"os/exec"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
-
-	"github.com/chromedp/chromedp"
 )
 
 const (
 	BaseURL      = "https://api.morelogin.com"
 	AppID        = "1690866404614480"
 	APIKey       = "289df9a3df534fffbc249e35944ba9af"
-	DeviceADB    = "98.98.125.30:20698"
 	CloudPhoneID = 1690867972145140
+
+	tokenRefreshBefore = 60 * time.Second // refresh trước khi hết hạn 60s
+)
+
+var (
+	cachedToken  string
+	cachedExpiry time.Time
 )
 
 // ─── STEP 1: Lấy Access Token ───────────────────────────────────────────────
-func getAccessToken() (string, error) {
+// getAccessToken gọi API lấy token mới, trả về (token, expiresIn giây, error).
+func getAccessToken() (string, int, error) {
 	payload := map[string]string{
 		"client_id":     AppID,
 		"client_secret": APIKey,
@@ -37,7 +45,7 @@ func getAccessToken() (string, error) {
 		bytes.NewBuffer(body),
 	)
 	if err != nil {
-		return "", fmt.Errorf("token request failed: %w", err)
+		return "", 0, fmt.Errorf("token request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -52,13 +60,32 @@ func getAccessToken() (string, error) {
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("parse token response failed: %w, body: %s", err, respBody)
+		return "", 0, fmt.Errorf("parse token response failed: %w, body: %s", err, respBody)
 	}
 	if result.Code != 0 {
-		return "", fmt.Errorf("token error code %d: %s", result.Code, result.Msg)
+		return "", 0, fmt.Errorf("token error code %d: %s", result.Code, result.Msg)
 	}
 
-	return result.Data.AccessToken, nil
+	return result.Data.AccessToken, result.Data.ExpiresIn, nil
+}
+
+// getValidAccessToken trả về token còn hiệu lực: dùng cache nếu chưa expired, không thì lấy mới.
+func getValidAccessToken() (string, error) {
+	if cachedToken != "" && time.Now().Before(cachedExpiry) {
+		log.Println("Using cached access token (not expired).")
+		return cachedToken, nil
+	}
+	log.Println("Token expired or missing, fetching new token...")
+	token, expiresIn, err := getAccessToken()
+	log.Println("Token:", token)
+	if err != nil {
+		return "", err
+	}
+	cachedToken = token
+	// Hết hạn sớm hơn expiresIn một chút để tránh dùng token sắp hết hạn
+	cachedExpiry = time.Now().Add(time.Duration(expiresIn)*time.Second - tokenRefreshBefore)
+	log.Println("Token cached, expires at", cachedExpiry.Format(time.RFC3339))
+	return token, nil
 }
 
 // ─── STEP 2: Gọi exeCommand qua Open API ────────────────────────────────────
@@ -95,89 +122,158 @@ func exeCommand(token string, cloudPhoneID int64, command string) (string, error
 	return result.Data, nil
 }
 
-// ─── STEP 3: ADB forward port 9222 ──────────────────────────────────────────
-
-func setupADBForward() error {
-	exec.Command("adb", "connect", DeviceADB).Run()
-	time.Sleep(time.Second)
-
-	out, err := exec.Command("adb", "-s", DeviceADB,
-		"forward", "tcp:9222", "localabstract:chrome_devtools_remote",
-	).CombinedOutput()
-	log.Printf("ADB forward output: %s", out)
+// ─── STEP 3: Upload get_js.sh lên cloud phone ────────────────────────────────
+func uploadFile(token string, cloudPhoneID int64, localFilePath string, uploadDest string) (string, error) {
+	f, err := os.Open(localFilePath)
 	if err != nil {
-		return fmt.Errorf("adb forward failed: %w, output: %s", err, out)
+		return "", fmt.Errorf("open upload file failed: %w", err)
 	}
-	log.Println("ADB forward OK:", string(out))
+	defer f.Close()
+
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+
+	// Doc: file (File), id (int64), uploadDest (string) — thứ tự giống doc
+	part, err := w.CreateFormFile("file", filepath.Base(localFilePath))
+	if err != nil {
+		_ = w.Close()
+		return "", fmt.Errorf("create multipart file part failed: %w", err)
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		_ = w.Close()
+		return "", fmt.Errorf("write multipart file part failed: %w", err)
+	}
+	_ = w.WriteField("id", fmt.Sprintf("%d", cloudPhoneID))
+	_ = w.WriteField("uploadDest", uploadDest)
+
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("close multipart writer failed: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", BaseURL+"/cloudphone/uploadFile", &body)
+	if err != nil {
+		return "", fmt.Errorf("build uploadFile request failed: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("uploadFile request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	var result struct {
+		Code int             `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	_ = json.Unmarshal(respBody, &result)
+
+	if result.Code != 0 {
+		return "", fmt.Errorf("uploadFile error code %d: %s, body: %s", result.Code, result.Msg, respBody)
+	}
+	if len(result.Data) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(string(result.Data)), nil
+}
+
+func writeGetJSScript(localPath string) error {
+	// Script tối giản: ưu tiên đọc giá trị từ /sdcard/jsvar.txt (nếu có),
+	// rồi in ra một dòng "JSVAR=...".
+	content := strings.Join([]string{
+		"#!/system/bin/sh",
+		"set -e",
+		"",
+		"JSVAR=\"\"",
+		"if [ -f /sdcard/jsvar.txt ]; then",
+		"  JSVAR=\"$(cat /sdcard/jsvar.txt | tr -d '\\r\\n')\"",
+		"fi",
+		"",
+		"echo \"JSVAR=${JSVAR}\"",
+		"",
+	}, "\n")
+
+	if err := os.WriteFile(localPath, []byte(content), 0o755); err != nil {
+		return fmt.Errorf("write %s failed: %w", localPath, err)
+	}
 	return nil
 }
 
-// ─── STEP 4: Lấy JS variable qua CDP ────────────────────────────────────────
-func getJSVariable(expression string) (interface{}, error) {
-	allocCtx, cancel := chromedp.NewRemoteAllocator(
-		context.Background(),
-		"http://localhost:9222",
-	)
-	defer cancel()
+var jsVarPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?m)^\s*JSVAR\s*=\s*(.*)\s*$`),
+	regexp.MustCompile(`(?m)^\s*JSVAR\s*:\s*(.*)\s*$`),
+}
 
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	ctx, cancel = context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	var result interface{}
-	err := chromedp.Run(ctx,
-		chromedp.Evaluate(expression, &result),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("CDP evaluate error: %w", err)
+func parseJSVAR(output string) (string, error) {
+	for _, re := range jsVarPatterns {
+		m := re.FindStringSubmatch(output)
+		if len(m) == 2 {
+			return strings.TrimSpace(m[1]), nil
+		}
 	}
-	return result, nil
+	return "", fmt.Errorf("JSVAR not found in output: %s", strings.TrimSpace(output))
 }
 
 // ─── MAIN ────────────────────────────────────────────────────────────────────
 
 func main() {
-	// 1. Lấy access token
+	// 1. Lấy access token (dùng cache nếu chưa expired)
 	log.Println("Getting access token...")
-	token, err := getAccessToken()
+	token, err := getValidAccessToken()
 	if err != nil {
 		log.Fatal("Auth failed:", err)
 	}
-	log.Println("Token OK:", token[:20]+"...")
 
-	// 2. Setup ADB forward
-	log.Println("Setting up ADB forward port 9222...")
-	if err := setupADBForward(); err != nil {
-		log.Fatal("ADB forward failed:", err)
-	}
-
-	// 3. Mở Chrome + URL qua exeCommand
+	// 2. Mở Chrome + URL qua exeCommand
 	targetURL := "https://savvysc.com/p/apparecchi-invisibili-convenienti-guida-completa-per-un-sorriso-allineato-a-costi-contenuti-524280.webm?__bt=true&_bot=2&_tag=581456_129_40_2353567_0&_type=index_link&ad_id=%7B%7Bad.id%7D%7D&ad_name=%7B%7Bad.name%7D%7D&arb_ad_id=2353567&arb_ad_id=2353567&arb_campaign_id=581456&arb_creative_id=2353567&arb_direct=on&campaign_id=%7B%7Bcampaign.id%7D%7D&campaign_name=%7B%7Bcampaign.name%7D%7D&dontRedirect=true&network=facebook&section_id=%7B%7Badset.id%7D%7D&section_name=%7B%7Badset.name%7D%7D&short_name=fbk&utm_campaign=arb-581456&utm_source=fb"
 	log.Println("Opening URL via exeCommand API...")
 	cmd := fmt.Sprintf(
 		"am start -a android.intent.action.VIEW -n com.android.chrome/com.google.android.apps.chrome.Main -d '%s'",
 		targetURL,
 	)
-	result, err := exeCommand(token, CloudPhoneID, cmd)
+	_, err = exeCommand(token, CloudPhoneID, cmd)
 	if err != nil {
 		log.Fatal("Open URL failed:", err)
 	}
-	log.Println("exeCommand result:", result)
 
-	// 4. Chờ page load
-	log.Println("Waiting for page load...")
+	// 3. Chờ Chrome khởi động
+	log.Println("Waiting for Chrome to start...")
 	time.Sleep(4 * time.Second)
 
-	// 5. Lấy JS variable qua CDP
-	log.Println("Fetching JS variable via CDP...")
-	val, err := getJSVariable("window.relatedAdShowing")
-	if err != nil {
-		log.Fatal("Get JS variable failed:", err)
+	// 4. Tạo file get_js.sh trên PC và upload lên /sdcard/
+	localScript := "get_js.sh"
+	remoteScript := "/sdcard/get_js.sh"
+
+	log.Println("Creating get_js.sh on PC...")
+	if err := writeGetJSScript(localScript); err != nil {
+		log.Fatal("Create get_js.sh failed:", err)
 	}
 
-	out, _ := json.MarshalIndent(val, "", "  ")
-	fmt.Println("\n=== Result ===")
-	fmt.Println(string(out))
+	log.Println("Uploading get_js.sh to /sdcard/ via uploadFile API...")
+	if _, err := uploadFile(token, CloudPhoneID, localScript, "/sdcard"); err != nil {
+		log.Fatal("Upload get_js.sh failed:", err)
+	}
+
+	// 5. chmod + chạy script qua exeCommand
+	log.Println("Executing get_js.sh on cloud phone...")
+	output, err := exeCommand(token, CloudPhoneID, fmt.Sprintf("chmod 755 %s && sh %s", remoteScript, remoteScript))
+	if err != nil {
+		log.Fatal("Run get_js.sh failed:", err)
+	}
+
+	// 6. Parse JSVAR từ output
+	jsvar, err := parseJSVAR(output)
+	if err != nil {
+		log.Fatal("Parse JSVAR failed:", err)
+	}
+
+	fmt.Println("\n=== Output ===")
+	fmt.Println(output)
+	fmt.Println("\n=== JSVAR ===")
+	fmt.Println(jsvar)
 }
