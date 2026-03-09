@@ -3,7 +3,7 @@ set -e
 
 JSVAR=""
 if [ -f /sdcard/jsvar.txt ]; then
-  JSVAR="$(cat /sdcard/jsvar.txt | tr -d '\r\n')"
+  JSVAR="$(/system/bin/cat /sdcard/jsvar.txt | /system/bin/tr -d '\r\n')"
 fi
 
 echo "JSVAR=${JSVAR}"

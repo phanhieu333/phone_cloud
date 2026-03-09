@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -22,6 +20,7 @@ const (
 	CloudPhoneID = 1690867972145140
 
 	tokenRefreshBefore = 60 * time.Second // refresh trước khi hết hạn 60s
+	tokenCacheFile     = ".morelogin_token"
 )
 
 var (
@@ -69,27 +68,85 @@ func getAccessToken() (string, int, error) {
 	return result.Data.AccessToken, result.Data.ExpiresIn, nil
 }
 
-// getValidAccessToken trả về token còn hiệu lực: dùng cache nếu chưa expired, không thì lấy mới.
+// loadTokenFromFile đọc token + expiry từ file cache, trả về (token, expiry, true) nếu hợp lệ.
+func loadTokenFromFile() (string, time.Time, bool) {
+	data, err := os.ReadFile(tokenCacheFile)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	var v struct {
+		Token  string `json:"token"`
+		Expiry string `json:"expiry"`
+	}
+	if json.Unmarshal(data, &v) != nil || v.Token == "" || v.Expiry == "" {
+		return "", time.Time{}, false
+	}
+	expiry, err := time.Parse(time.RFC3339, v.Expiry)
+	if err != nil || time.Now().After(expiry) {
+		return "", time.Time{}, false
+	}
+	return v.Token, expiry, true
+}
+
+// saveTokenToFile ghi token + expiry ra file cache.
+func saveTokenToFile(token string, expiry time.Time) {
+	v := struct {
+		Token  string `json:"token"`
+		Expiry string `json:"expiry"`
+	}{Token: token, Expiry: expiry.Format(time.RFC3339)}
+	data, _ := json.Marshal(v)
+	if err := os.WriteFile(tokenCacheFile, data, 0o600); err != nil {
+		log.Println("Warning: could not write token cache file:", err)
+		return
+	}
+	log.Println("Token saved to cache file:", tokenCacheFile)
+}
+
+// clearTokenCache xóa token trong memory và file (dùng khi API trả 35002 để lần sau lấy token mới).
+func clearTokenCache() {
+	cachedToken = ""
+	cachedExpiry = time.Time{}
+	_ = os.Remove(tokenCacheFile)
+	log.Println("Token cache cleared (will fetch new token next time).")
+}
+
+// isAuthError trả về true nếu lỗi là xác thực API (35002, authentication failed).
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "35002") || strings.Contains(s, "authentication failed")
+}
+
+// getValidAccessToken trả về token còn hiệu lực: dùng cache (memory hoặc file) nếu chưa expired, không thì lấy mới.
 func getValidAccessToken() (string, error) {
-	if cachedToken != "" && time.Now().Before(cachedExpiry) {
-		log.Println("Using cached access token (not expired).")
+	now := time.Now()
+	if cachedToken != "" && now.Before(cachedExpiry) {
+		log.Println("Using cached access token (memory, not expired).")
+		return cachedToken, nil
+	}
+	if token, expiry, ok := loadTokenFromFile(); ok {
+		cachedToken = token
+		cachedExpiry = expiry
+		log.Println("Using cached access token (from file, expires at", cachedExpiry.Format(time.RFC3339)+").")
 		return cachedToken, nil
 	}
 	log.Println("Token expired or missing, fetching new token...")
 	token, expiresIn, err := getAccessToken()
-	log.Println("Token:", token)
 	if err != nil {
 		return "", err
 	}
 	cachedToken = token
-	// Hết hạn sớm hơn expiresIn một chút để tránh dùng token sắp hết hạn
-	cachedExpiry = time.Now().Add(time.Duration(expiresIn)*time.Second - tokenRefreshBefore)
-	log.Println("Token cached, expires at", cachedExpiry.Format(time.RFC3339))
+	cachedExpiry = now.Add(time.Duration(expiresIn)*time.Second - tokenRefreshBefore)
+	saveTokenToFile(cachedToken, cachedExpiry)
+	log.Println("Token cached (memory + file), expires at", cachedExpiry.Format(time.RFC3339))
 	return token, nil
 }
 
 // ─── STEP 2: Gọi exeCommand qua Open API ────────────────────────────────────
 func exeCommand(token string, cloudPhoneID int64, command string) (string, error) {
+	log.Println("Executing command:", command)
 	payload := map[string]interface{}{
 		"id":      cloudPhoneID,
 		"command": command,
@@ -114,7 +171,9 @@ func exeCommand(token string, cloudPhoneID int64, command string) (string, error
 		Msg  string `json:"msg"`
 		Data string `json:"data"`
 	}
-	json.Unmarshal(respBody, &result)
+	jsonData := json.Unmarshal(respBody, &result)
+
+	log.Println("jsonData:", jsonData)
 
 	if result.Code != 0 {
 		return "", fmt.Errorf("exeCommand error code %d: %s, body: %s", result.Code, result.Msg, respBody)
@@ -123,65 +182,85 @@ func exeCommand(token string, cloudPhoneID int64, command string) (string, error
 }
 
 // ─── STEP 3: Upload get_js.sh lên cloud phone ────────────────────────────────
-func uploadFile(token string, cloudPhoneID int64, localFilePath string, uploadDest string) (string, error) {
-	f, err := os.Open(localFilePath)
-	if err != nil {
-		return "", fmt.Errorf("open upload file failed: %w", err)
-	}
-	defer f.Close()
-
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-
-	// Doc: file (File), id (int64), uploadDest (string) — thứ tự giống doc
-	part, err := w.CreateFormFile("file", filepath.Base(localFilePath))
-	if err != nil {
-		_ = w.Close()
-		return "", fmt.Errorf("create multipart file part failed: %w", err)
-	}
-	if _, err := io.Copy(part, f); err != nil {
-		_ = w.Close()
-		return "", fmt.Errorf("write multipart file part failed: %w", err)
-	}
-	_ = w.WriteField("id", fmt.Sprintf("%d", cloudPhoneID))
-	_ = w.WriteField("uploadDest", uploadDest)
-
-	if err := w.Close(); err != nil {
-		return "", fmt.Errorf("close multipart writer failed: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", BaseURL+"/cloudphone/uploadFile", &body)
-	if err != nil {
-		return "", fmt.Errorf("build uploadFile request failed: %w", err)
-	}
+// Theo MoreLogin API (Cloud Phone / File Management):
+// 1) Get file upload URL (POST /cloudphone/uploadUrl) → nhận presignedUrl.
+// 2) Dùng HTTPS PUT upload file lên presignedUrl (upload to cloud storage).
+// 3) Sau khi PUT xong mới gọi Uploading files (POST /cloudphone/uploadFile).
+func uploadScriptToDevice(token string, deviceID int64, scriptContent, fileName string) error {
+	// Bước 1: POST /cloudphone/uploadUrl → nhận presignedUrl
+	payload, _ := json.Marshal(map[string]interface{}{
+		"id":       deviceID,
+		"fileName": fileName,
+	})
+	req, _ := http.NewRequest("POST", BaseURL+"/cloudphone/uploadUrl", bytes.NewBuffer(payload))
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("uploadFile request failed: %w", err)
+		return fmt.Errorf("get file upload URL: %w", err)
 	}
 	defer resp.Body.Close()
 
+	var urlResult struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			PresignedUrl string `json:"presignedUrl"`
+		} `json:"data"`
+	}
 	respBody, _ := io.ReadAll(resp.Body)
+	json.Unmarshal(respBody, &urlResult)
+	if urlResult.Code != 0 {
+		return fmt.Errorf("uploadUrl error %d: %s", urlResult.Code, urlResult.Msg)
+	}
+	presignedUrl := urlResult.Data.PresignedUrl
+	log.Println("Step 1 OK - presignedUrl:", presignedUrl[:50]+"...")
 
-	var result struct {
-		Code int             `json:"code"`
-		Msg  string          `json:"msg"`
-		Data json.RawMessage `json:"data"`
+	// Bước 2: PUT file lên S3 qua presignedUrl
+	putReq, _ := http.NewRequest("PUT", presignedUrl, bytes.NewBufferString(scriptContent))
+	putReq.Header.Set("Content-Type", "application/octet-stream")
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("PUT to S3: %w", err)
 	}
-	_ = json.Unmarshal(respBody, &result)
+	io.Copy(io.Discard, putResp.Body)
+	putResp.Body.Close()
+	if putResp.StatusCode < 200 || putResp.StatusCode >= 300 {
+		return fmt.Errorf("PUT failed: %s", putResp.Status)
+	}
+	log.Println("Step 2 OK - file uploaded to S3")
 
-	if result.Code != 0 {
-		return "", fmt.Errorf("uploadFile error code %d: %s, body: %s", result.Code, result.Msg, respBody)
+	// Bước 3: POST /cloudphone/uploadFile - JSON
+	payload3, _ := json.Marshal(map[string]interface{}{
+		"id":         deviceID,
+		"url":        presignedUrl,
+		"uploadDest": "/sdcard/",
+	})
+	req3, _ := http.NewRequest("POST", BaseURL+"/cloudphone/uploadFile", bytes.NewBuffer(payload3))
+	req3.Header.Set("Authorization", "Bearer "+token)
+	req3.Header.Set("Content-Type", "application/json")
+
+	resp3, err := http.DefaultClient.Do(req3)
+	if err != nil {
+		return fmt.Errorf("uploadFile: %w", err)
 	}
-	if len(result.Data) == 0 {
-		return "", nil
+	defer resp3.Body.Close()
+
+	respBody3, _ := io.ReadAll(resp3.Body)
+	log.Println("Step 3 response:", string(respBody3))
+
+	var result3 struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
 	}
-	return strings.TrimSpace(string(result.Data)), nil
+	json.Unmarshal(respBody3, &result3)
+	if result3.Code != 0 {
+		return fmt.Errorf("uploadFile error %d: %s", result3.Code, result3.Msg)
+	}
+	log.Println("Step 3 OK - file copied to device")
+	return nil
 }
-
 func writeGetJSScript(localPath string) error {
 	// Script tối giản: ưu tiên đọc giá trị từ /sdcard/jsvar.txt (nếu có),
 	// rồi in ra một dòng "JSVAR=...".
@@ -255,13 +334,26 @@ func main() {
 	}
 
 	log.Println("Uploading get_js.sh to /sdcard/ via uploadFile API...")
-	if _, err := uploadFile(token, CloudPhoneID, localScript, "/sdcard"); err != nil {
+	scriptContent, err := os.ReadFile(localScript)
+	if err != nil {
+		log.Fatal("Read get_js.sh failed:", err)
+	}
+	if err := uploadScriptToDevice(token, CloudPhoneID, string(scriptContent), "get_js.sh"); err != nil {
 		log.Fatal("Upload get_js.sh failed:", err)
 	}
 
-	// 5. chmod + chạy script qua exeCommand
-	log.Println("Executing get_js.sh on cloud phone...")
-	output, err := exeCommand(token, CloudPhoneID, fmt.Sprintf("chmod 755 %s && sh %s", remoteScript, remoteScript))
+	// 5. Chạy script qua exeCommand (không dùng chmod — API/device có thể không cho)
+	log.Println("Executing get_js.sh on cloud phone (sh file)...")
+	runCmd := fmt.Sprintf("sh %s", remoteScript)
+	output, err := exeCommand(token, CloudPhoneID, runCmd)
+	if err != nil {
+
+		// Lỗi do lệnh (không phải auth): fallback sang cat file | sh.
+		log.Println("Command failed (not auth), trying fallback: cat file | sh ...")
+		runCmd = fmt.Sprintf("cat %s | sh", remoteScript)
+		output, err = exeCommand(token, CloudPhoneID, runCmd)
+	}
+	log.Println("Output:", output)
 	if err != nil {
 		log.Fatal("Run get_js.sh failed:", err)
 	}
